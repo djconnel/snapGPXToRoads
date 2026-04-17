@@ -1,0 +1,387 @@
+#! /usr/bin/env python3.14
+'''
+GPX Track Snap to Roads
+Uses Google Maps Roads API to snap GPS points to roads
+'''
+
+import argparse
+import gpxpy
+import gpxpy.gpx
+import requests
+import sys
+import re
+from sys import stderr, stdin, stdout
+from typing import List, Tuple
+from GPXUtils import *
+
+__version__ = 0.01
+
+
+# Configuration
+API_KEY = 'insert 39-digit alphanumeric API key here'
+API_KEY_RE = r'[a-zA-Z0-9]{39}'
+ROADS_API_URL = 'https://roads.googleapis.com/v1/snapToRoads'
+BATCH_SIZE = 100  # Maximum points per API request
+
+def snap_to_roads_position(points, api_key, isLoop = False, interpolate = False):
+  '''
+  Snap GPS points to roads using Google Maps Roads API.
+  Processes points in batches of BATCH_SIZE.
+  
+  Args:
+    points: List of GPX points
+    api_key: Google Maps API key
+    interpolate: whether to interpolate
+
+  Returns:
+    List of snapped points
+
+  This only deals with position. Elevation and other fields need to be
+  handled by the caller
+  '''
+
+  # if it's a loop, make sure route closes
+  if isLoop and not pointsAreClose(points[0], points[-1]):
+    points[-1] = copyPoint(points[0])
+  
+  snapped_points = []
+  original_indices = []
+  # batches:
+  # 1 - 100: 1
+  # 101 - 199: 2
+  # 200 - 298: 3
+  # etc
+  total_batches = (len(points) + BATCH_SIZE - 3) // (BATCH_SIZE - 1)
+
+  stderr.write(f'Snapping {len(points)} points to roads in {total_batches} batches...\n')
+
+  batch_num = 0
+  for i in range(0, len(points), BATCH_SIZE - 1):
+    batch_num += 1
+    batch = points[i:i + BATCH_SIZE]
+    
+    stderr.write(f'Processing batch {batch_num}/{total_batches} ({len(batch)} points)\n')
+    
+    # Format points as "lat,lng|lat,lng|..."
+    path_string = '|'.join([f'{p.latitude},{p.longitude}' for p in batch])
+    
+    # Make API request
+    params = {
+      'path': path_string,
+      'interpolate': str(interpolate),  # Interpolate between points
+      'key': api_key
+    }
+    
+    try:
+      response = requests.get(ROADS_API_URL, params=params)
+      response.raise_for_status()
+      
+      data = response.json()
+      key = 'snappedPoints'
+      
+      if key in data:
+        snappedPoints = data[key]
+        if batch_num > 1:
+          ps = snappedPoints[1:]
+        else:
+          ps = snappedPoints
+        for snappedPoint in ps:
+          location = snappedPoint['location']
+          snapped_points.append(gpxpy.gpx.GPXTrackPoint(location['latitude'], location['longitude']))
+          if 'originalIndex' in snappedPoint:
+            originalIndex = snappedPoint['originalIndex'] + i
+          else:
+            originalIndex = None
+          original_indices.append(originalIndex)
+        stderr.write(f'  Received {len(snappedPoints)} snapped points\n')
+      else:
+        stderr.write(f'  Warning: No snapped points returned for batch {batch_num}\n')
+        # Fallback to original points
+        snapped_points = points.copy()
+    except requests.exceptions.RequestException as e:
+      stderr.write(f'  Error processing batch {batch_num}: {e}\n')
+      stderr.write(f'  Using original points for this batch\n')
+      # Fallback to original points
+      snapped_points = points.copy()
+
+  stderr.write(f'Total snapped points: {len(snapped_points)}\n')
+  return snapped_points, original_indices
+
+
+def snap_to_roads(points, api_key, isLoop = False, interpolate = False):
+  '''
+  Snap GPS points to roads using Google Maps Roads API.
+  Processes points in batches of BATCH_SIZE.
+  
+  Args:
+    points: List of (latitude, longitude) tuples
+    api_key: Google Maps API key
+    interpolate: whether to do interpolation
+    
+  Returns:
+    List of snapped points
+
+  Google Maps API tags points with the original point if
+  they are direct snaps, then interpolates additional points.
+  The altitudes of the original points are transferred directly,
+  while interpolated points have linearly interpolated altitudes
+  '''
+
+  # now snap with interpolation, additionally interplating altitude
+  snappedPoints, snappedIndices = snap_to_roads_position(points = points, api_key = api_key, interpolate = interpolate)
+
+  # if not interpolate, just copy the elevations
+  if not interpolate:
+    for i in range(len(points)):
+      p = copyPoint(points[i])
+      p.longitude = snappedPoints[i].longitude
+      p.latitude = snappedPoints[i].latitude
+      snappedPoints[i] = p
+    return snappedPoints
+  
+  # make sure last point has an snapped index
+  if snappedIndices[-1] is None:
+    snappedIndices[-1] = len(points) - 1
+
+  # present snapped point: i
+  i = 0
+  j = 0
+  # bracketing points: u, v
+  u = 0
+  v = 0
+  while i < len(snappedPoints):
+    # if this is an anchor point, copy the altitude
+    if snappedIndices[i] is not None:
+      u = snappedIndices[i]
+      p = copyPoint(points[u])
+      p.latitude = snappedPoints[i].latitude
+      p.longitude = snappedPoints[i].longitude
+      snappedPoints[i] = p
+      j = i + 1
+      v = None
+      while j < len(snappedPoints):
+        if snappedIndices[j] is None:
+          j += 1
+        else:
+          v = snappedIndices[j]
+          break
+      i += 1
+      continue
+
+    # we are between anchor points: interpolate to next anchor point
+    # calculate distances:
+    z1 = points[u].elevation
+    if v is None:
+      z2 = z1
+    else:
+      z2 = points[v].elevation
+    j = i + 1
+    while j < len(snappedIndices) - 1 and snappedIndices[j] is None:
+      j += 1
+
+    # now u is position of the next anchor point
+    ds = [0]
+    for k in range(i - 1, j):
+      ds.append(ds[-1] + pointDistance(snappedPoints[k], snappedPoints[k + 1]))
+    for k in range(i, j):
+      f = ds[1 + k - i] / ds[1 + j - i]
+      z = z1 * (1 - f) + z2 * f
+      snappedPoints[k].elevation = z
+    i = j
+  return snappedPoints
+
+def fixLoopAltitudes(points):
+  '''make sure altitudes are smooth at S/F for loop course'''
+  p1 = points[-2]
+  p2 = points[-1]
+  p3 = points[0]
+  ds = [0]
+  for i in range(1, len(points)):
+    ds.append(pointDistance(points[i - 1], points[i]))
+
+  courseDistance = ds[-1] + pointDistance(p2, p3)
+  f = (ds[-1] - ds[-2]) / courseDistance
+  z = points[-2].elevation * (1 - f) + points[0].elevation * f
+  dz = z - points[-1].elevation
+  for i in range(len(points)):
+    f = ds[i] / courseDistance
+    points[i].elevation += dz * f
+
+def export_gpx(points, output_file, input_file):
+  '''
+  Export snapped points to a new GPX file.
+  
+  Args:
+    points: List GPX points
+    output_file: filepointer to output file
+    input_file: filepointer to input file
+  '''
+    # Create new GPX object
+  gpx = gpxpy.gpx.GPX()
+  
+  # Copy metadata from original if available
+  if input_file:
+    try:
+      original_gpx = gpxpy.parse(input_file)
+      if original_gpx.name:
+        gpx.name = f'{original_gpx.name} (Snapped)'
+      if original_gpx.description:
+        gpx.description = original_gpx.description
+    except:
+      pass
+  
+  # Create a track and segment
+  gpx_track = gpxpy.gpx.GPXTrack()
+  gpx.tracks.append(gpx_track)
+  gpx_track.name = 'Snapped Track'
+  
+  gpx_segment = gpxpy.gpx.GPXTrackSegment()
+  gpx_track.segments.append(gpx_segment)
+  
+  # Add all snapped points
+  gpx_segment.points = points
+
+  # Write to file
+  output_file.write(gpx.to_xml())
+  
+  stderr.write(f'Successfully exported {len(points)} points\n')
+
+
+def main():
+  '''Main function to orchestrate the GPX snapping process.'''
+
+  parser = argparse.ArgumentParser(
+    description= 'Snap GPX files to the Google Maps road database, interpolating altitude.'
+  )
+
+  parser.add_argument(
+    '-i', '--input', '--in',
+    type=str,
+    default=None,
+    help='Name of input file, or "-" for standard input (default).'
+  )
+
+  parser.add_argument(
+    '-o', '--output', '--out',
+    type=str,
+    default=None,
+    help='Name of output file, or "-" for standard output (default).'
+  )
+
+  parser.add_argument(
+    '--apikey', '--APIKey',
+    type=str,
+    default= API_KEY,
+    help='39 character Google Maps API key.'
+  )
+
+  parser.add_argument(
+    '--interpolate',
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help='Enable or disable interpolation (optional, default: True).',
+  )
+
+  parser.add_argument(
+    '--simplifyOnly',
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help='simplifies the route but does not snap it',
+  )
+
+  parser.add_argument(
+    '--simplify',
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help='whether the simplificatin algorithm is used before snapping to reduce the number of API calls',
+  )
+
+  args = parser.parse_args()
+
+  # --- Access the parsed values ---
+  input_file = args.input
+  output_file = args.output
+  interpolate = args.interpolate
+  simplifyOnly = args.simplifyOnly
+  simplify = args.simplify
+  api_key = args.apikey
+  stderr.write(f'input_file = {input_file}\noutput_file = {output_file}\ninterpolate = {interpolate}\napi_key = {api_key}\n')
+  
+  if isinstance(input_file, str):
+    if input_file == '-':
+      input_file = stdin
+    else:
+      try:
+        stderr.write(f'opening input file : {input_file}\n')
+        input_file = open(input_file, 'r')
+      except:
+        stderr.write('Error opening file ' + input_file + '\n')
+  if isinstance(output_file, str):
+    if output_file == '-':
+      output_file = stdout
+    else:
+      try:
+        stderr.write(f'opening output file : {output_file}\n')
+        output_file = open(output_file, 'w')
+      except:
+        stderr.write('Error opening file ' + output_file + '\n')
+        sys.exit(1)
+
+  if not re.fullmatch(API_KEY_RE, api_key):
+    stderr.write('Error: Please provide a valid Google Maps API key\n')
+    stderr.write('Either edit the API_KEY variable in the script or pass it as a command line argument\n')
+    sys.exit(1)
+
+  try:
+    # Step 1: Load GPX file
+    points = removeDuplicatePoints(load_gpx(input_file))
+
+    if not points:
+      stderr.write('Error: No points found in GPX file\n')
+      sys.exit(1)
+
+    isLoop = checkLoop(points = points)
+    if isLoop:
+      stderr.write('The route is a circuit\n')
+      if not pointsAreClose(points[0], points[-1]):
+        points.append(copyPoint(points[-1]))
+      else:
+        stderr.write('The route is not a circuit\n')
+
+    stderr.write(f'initial points = {len(points)}\n')
+    
+    # Step 2: simplify points
+    if simplify:
+      points = simplifyPoints(points= points)
+      stderr.write(f'simplified points = {len(points)}\n')
+
+    if simplifyOnly:
+      # Step 3: export points
+      export_gpx(points= points, output_file = output_file, input_file = input_file)
+    else:
+      # Step 3: Snap points to roads
+      snapped_points = snap_to_roads(points = points, api_key = api_key, interpolate= interpolate, isLoop= isLoop)
+
+      # step 4: make sure altitudes are smooth (if it's a loop course)
+      if isLoop:
+        fixLoopAltitudes(points = snapped_points)
+
+      # step 5: export points
+      export_gpx(points= snapped_points, output_file = output_file, input_file = input_file)
+
+    
+    stderr.write('\n✓ Process completed successfully!\n')
+    
+  except FileNotFoundError:
+    stderr.write(f'Error: Could not find file "{input_file}"\n')
+    sys.exit(1)
+  except Exception as e:
+    stderr.write(f'Error: {e}\n')
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+
+if __name__ == '__main__':
+  main()
+  
