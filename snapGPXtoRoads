@@ -1,8 +1,131 @@
 #! /usr/bin/env python3.14
+
+# version bistory:
+# 0.01: first release
+# 0.02: add GOOGLE_MAPS_API_KEY environemnt variable, provide help information, added RMS shift reporting
+
+'''VERSION
+   0.02
+
+DESCRIPTION
+
+This code is intended to take GPS data, for example downloaded from
+Strava activities, and applies the Google Maps "snap to road" API to
+shift points to roads, while retaining altitude data from the GPS
+data.  This is useful when altitude data from topographical sources,
+for example Strave route editor, is inferior to data from a GPS
+source.  On the other hand, GPS data tends to have limited position
+resolution, so "snapping to roads" may make it more suitable for route
+generation, either for navigation, or for a cycling simulator such as
+BikeTerra, Rouvy, or Training Peaks Virtual.
+
+The Google Maps "snap to road" API requires an API key.  As of this
+writing, this is available free with limited monthly use, sufficient
+for typical personal use.  To run this code, you will need an API
+key. For more details, see:
+
+https://developers.google.com/maps/documentation/roads/snap
+
+To run the code, there are three ways to provide the API key, which is
+expected to be a 39-digit alphanumeric string:
+
+1. edit the source code and set the variable API_KEY to your API key.
+
+2. set the environment variable GOOGLE_MAPS_API_KEY in your shell to the
+API key.
+
+3. use the -a or --APIKey command line options.
+
+If no valid API key is available, the code will terminate with an error.
+
+The input file is specified with the --input (or -i) option.  If no
+input file is specified, the "standard input" will be used.
+
+The output file is specified with the --output (or -o) option.  If no
+output is specified, the "standard output" will be used.
+
+The API processes points in bundles of 100.  Since there is overlap
+between adjacent bundles, the effective bundle size is 99 points.  As
+of this writing, the free monthly limit for API calls is 5000.  So the
+fewer points, the fewer API calls, and the more routes which can be
+processed per month.  GPS data may contain a large number of points.
+For example, a 5 hour activity with one point per second has 18
+thousand points.  This would be 180 API calls, 3.6% of the monthly
+limit.
+
+However, typically this large number of points is not needed.  To
+reduce the number of points and therefore the number of API calls, the
+route is simplified first using a recursive algorithm.  However, if
+you do not want this simplification step, specify the --no-simplify
+option.  It can be explicitly turned on with the --simplify option (or
+-s), not typically needed.  To test the simplification step without
+any point snapping, specify --simplifyOnly (or -S) The GPX file will
+contain only simplified points without any shift.
+
+Google snap to roads has two modes: with or without interpolation.
+Without interpolation it snaps only the points in the input file,
+after any simplification.  This may be insufficient to resolve fine
+details, so interpolation typically results in a better result.
+Interpolation does not add any API calls, just the number of points
+returned by the API calls.  This results in two types of points,
+"anchor points" which are directly shifted from original points, and
+"interpolated points" which are between anchor points.  Elevations
+from anchor points are retained from the original.  Elevations from
+interpolated points are generated assuming a constant gradient between
+anchor points.  Interpolation is the default, but can be explicitly
+specified with the --interpolation (or -I) option.  If you do not want
+interpolation, you can specify --no-interpolation.
+
+If a course is a loop, that is automatically determine from the data,
+or use the --loop option (or -l) to explicitly turn it on or --no-loop
+to explicity turn it off.  For loop courses, the loop is automatically
+"closed" (by having the final point roughly coincide with the first
+point) and the altitudes are adjusted so that the connection is a
+smooth gradient.  So an offset is applied to the final point, and the
+offset is applied to all other points using a constant gradient
+adjustment between the first and last points.
+
+Snap to roads tends to result in perturbations to a smooth gradient,
+For example, points which were initially separated by some distance,
+for example 5 to 10 meters typical for data from a bike computer, may
+be compressed by snapping these points to a sharp corner.  This will
+show up as gradient spikes.  Additionally, road corners, especially
+sharp corners, may appear in the map data to be sharp corners, as
+opposed to rounded corners.  For some applications (for example
+cycling simulators) the sharp corners are a problem.  So it's
+beneficial to smooth the data after snapping.  This can be done with a
+program like processGPX (https://processGPX.com, or
+https://github.com/djconnel/processGPX) or GPXMagic (Google search for
+URL).
+
+DEENDENCIES
+
+The following python libraries are used:
+
+* argparse: parsing arguments
+
+* gpxpy: process GPX files
+
+* requests: accessing URLs
+
+* sys: general system functions
+
+* re: regular expression matching
+
+* os: general operating system functions
+
+* GPXUtils : a library provided in this project.
+     Install it somewhere in PYTHONPATH.
+
+AUTHORS
+    <Daniel Connelly <djconnel@gmail.com>
+
+LICENSE
+    This program is covered by the terms of the MIT license.
+
 '''
-GPX Track Snap to Roads
-Uses Google Maps Roads API to snap GPS points to roads
-'''
+
+__version__ = 0.02
 
 import argparse
 import gpxpy
@@ -11,23 +134,26 @@ import requests
 import sys
 import re
 from sys import stderr, stdin, stdout
-from typing import List, Tuple
+from os import environ
 from GPXUtils import *
-
-__version__ = 0.01
 
 
 # Configuration
-API_KEY = 'insert 39-digit alphanumeric API key here'
 API_KEY_RE = r'[a-zA-Z0-9]{39}'
 ROADS_API_URL = 'https://roads.googleapis.com/v1/snapToRoads'
 BATCH_SIZE = 100  # Maximum points per API request
+
+# GOOGLE maps API key is optionally stored in an environment variable
+API_KEY = environ.get('GOOGLE_MAPS_API_KEY')
+
+def print_help():
+  print(__doc__)
 
 def snap_to_roads_position(points, api_key, isLoop = False, interpolate = False):
   '''
   Snap GPS points to roads using Google Maps Roads API.
   Processes points in batches of BATCH_SIZE.
-  
+
   Args:
     points: List of GPX points
     api_key: Google Maps API key
@@ -43,7 +169,7 @@ def snap_to_roads_position(points, api_key, isLoop = False, interpolate = False)
   # if it's a loop, make sure route closes
   if isLoop and not pointsAreClose(points[0], points[-1]):
     points[-1] = copyPoint(points[0])
-  
+
   snapped_points = []
   original_indices = []
   # batches:
@@ -59,26 +185,26 @@ def snap_to_roads_position(points, api_key, isLoop = False, interpolate = False)
   for i in range(0, len(points), BATCH_SIZE - 1):
     batch_num += 1
     batch = points[i:i + BATCH_SIZE]
-    
+
     stderr.write(f'Processing batch {batch_num}/{total_batches} ({len(batch)} points)\n')
-    
+
     # Format points as "lat,lng|lat,lng|..."
     path_string = '|'.join([f'{p.latitude},{p.longitude}' for p in batch])
-    
+
     # Make API request
     params = {
       'path': path_string,
       'interpolate': str(interpolate),  # Interpolate between points
       'key': api_key
     }
-    
+
     try:
       response = requests.get(ROADS_API_URL, params=params)
       response.raise_for_status()
-      
+
       data = response.json()
       key = 'snappedPoints'
-      
+
       if key in data:
         snappedPoints = data[key]
         if batch_num > 1:
@@ -112,12 +238,12 @@ def snap_to_roads(points, api_key, isLoop = False, interpolate = False):
   '''
   Snap GPS points to roads using Google Maps Roads API.
   Processes points in batches of BATCH_SIZE.
-  
+
   Args:
     points: List of (latitude, longitude) tuples
     api_key: Google Maps API key
     interpolate: whether to do interpolation
-    
+
   Returns:
     List of snapped points
 
@@ -130,6 +256,10 @@ def snap_to_roads(points, api_key, isLoop = False, interpolate = False):
   # now snap with interpolation, additionally interplating altitude
   snappedPoints, snappedIndices = snap_to_roads_position(points = points, api_key = api_key, interpolate = interpolate)
 
+  # report on deviation
+  sumd2 = 0
+  nSum = 0
+
   # if not interpolate, just copy the elevations
   if not interpolate:
     for i in range(len(points)):
@@ -138,7 +268,7 @@ def snap_to_roads(points, api_key, isLoop = False, interpolate = False):
       p.latitude = snappedPoints[i].latitude
       snappedPoints[i] = p
     return snappedPoints
-  
+
   # make sure last point has an snapped index
   if snappedIndices[-1] is None:
     snappedIndices[-1] = len(points) - 1
@@ -154,6 +284,8 @@ def snap_to_roads(points, api_key, isLoop = False, interpolate = False):
     if snappedIndices[i] is not None:
       u = snappedIndices[i]
       p = copyPoint(points[u])
+      sumd2 += pointDistance(points[u], snappedPoints[i]) ** 2
+      nSum += 1
       p.latitude = snappedPoints[i].latitude
       p.longitude = snappedPoints[i].longitude
       snappedPoints[i] = p
@@ -188,6 +320,11 @@ def snap_to_roads(points, api_key, isLoop = False, interpolate = False):
       z = z1 * (1 - f) + z2 * f
       snappedPoints[k].elevation = z
     i = j
+
+  if nSum > 0:
+    rmsd = sqrt(sumd2 / nSum)
+    stderr.write(f'RMS point shift = {rmsd:g} meters\n')
+
   return snappedPoints
 
 def fixLoopAltitudes(points):
@@ -210,7 +347,7 @@ def fixLoopAltitudes(points):
 def export_gpx(points, output_file, input_file):
   '''
   Export snapped points to a new GPX file.
-  
+
   Args:
     points: List GPX points
     output_file: filepointer to output file
@@ -218,7 +355,7 @@ def export_gpx(points, output_file, input_file):
   '''
     # Create new GPX object
   gpx = gpxpy.gpx.GPX()
-  
+
   # Copy metadata from original if available
   if input_file:
     try:
@@ -229,71 +366,80 @@ def export_gpx(points, output_file, input_file):
         gpx.description = original_gpx.description
     except:
       pass
-  
+
   # Create a track and segment
   gpx_track = gpxpy.gpx.GPXTrack()
   gpx.tracks.append(gpx_track)
   gpx_track.name = 'Snapped Track'
-  
+
   gpx_segment = gpxpy.gpx.GPXTrackSegment()
   gpx_track.segments.append(gpx_segment)
-  
+
   # Add all snapped points
   gpx_segment.points = points
 
   # Write to file
   output_file.write(gpx.to_xml())
-  
+
   stderr.write(f'Successfully exported {len(points)} points\n')
+
 
 
 def main():
   '''Main function to orchestrate the GPX snapping process.'''
 
   parser = argparse.ArgumentParser(
-    description= 'Snap GPX files to the Google Maps road database, interpolating altitude.'
+    formatter_class = argparse.RawTextHelpFormatter,
+    description= __doc__
   )
 
   parser.add_argument(
     '-i', '--input', '--in',
     type=str,
     default=None,
-    help='Name of input file, or "-" for standard input (default).'
+    help='Name of input file, or use -i- for standard input (default).'
   )
 
   parser.add_argument(
     '-o', '--output', '--out',
     type=str,
     default=None,
-    help='Name of output file, or "-" for standard output (default).'
+    help='Name of output file, or use -o- for standard output (default).'
   )
 
   parser.add_argument(
-    '--apikey', '--APIKey',
+    '-a', '--apikey', '--APIKey',
     type=str,
     default= API_KEY,
     help='39 character Google Maps API key.'
   )
 
   parser.add_argument(
-    '--interpolate',
+    '-I', '--interpolate',
     action=argparse.BooleanOptionalAction,
     default=True,
     help='Enable or disable interpolation (optional, default: True).',
   )
 
   parser.add_argument(
-    '--simplifyOnly',
+    '-S', '--simplifyOnly',
     action=argparse.BooleanOptionalAction,
     default=False,
     help='simplifies the route but does not snap it',
   )
 
   parser.add_argument(
-    '--simplify',
+    '-s', '--simplify',
     action=argparse.BooleanOptionalAction,
     default=True,
     help='whether the simplificatin algorithm is used before snapping to reduce the number of API calls',
+  )
+
+  parser.add_argument(
+    '-l', '--loop',
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help='specify that the course is m loop.  This is normally determined automatically.  Specify no loop with --no-loop.',
   )
 
   args = parser.parse_args()
@@ -304,9 +450,10 @@ def main():
   interpolate = args.interpolate
   simplifyOnly = args.simplifyOnly
   simplify = args.simplify
+  isLoop = args.loop
   api_key = args.apikey
   stderr.write(f'input_file = {input_file}\noutput_file = {output_file}\ninterpolate = {interpolate}\napi_key = {api_key}\n')
-  
+
   if isinstance(input_file, str):
     if input_file == '-':
       input_file = stdin
@@ -326,8 +473,11 @@ def main():
       except:
         stderr.write('Error opening file ' + output_file + '\n')
         sys.exit(1)
+  else:
+    output_file = stdout
 
-  if not re.fullmatch(API_KEY_RE, api_key):
+
+  if api_key is None or not re.fullmatch(API_KEY_RE, api_key):
     stderr.write('Error: Please provide a valid Google Maps API key\n')
     stderr.write('Either edit the API_KEY variable in the script or pass it as a command line argument\n')
     sys.exit(1)
@@ -340,7 +490,8 @@ def main():
       stderr.write('Error: No points found in GPX file\n')
       sys.exit(1)
 
-    isLoop = checkLoop(points = points)
+    if isLoop is None:
+      isLoop = checkLoop(points = points)
     if isLoop:
       stderr.write('The route is a circuit\n')
       if not pointsAreClose(points[0], points[-1]):
@@ -349,7 +500,7 @@ def main():
         stderr.write('The route is not a circuit\n')
 
     stderr.write(f'initial points = {len(points)}\n')
-    
+
     # Step 2: simplify points
     if simplify:
       points = simplifyPoints(points= points)
@@ -369,9 +520,9 @@ def main():
       # step 5: export points
       export_gpx(points= snapped_points, output_file = output_file, input_file = input_file)
 
-    
+
     stderr.write('\n✓ Process completed successfully!\n')
-    
+
   except FileNotFoundError:
     stderr.write(f'Error: Could not find file "{input_file}"\n')
     sys.exit(1)
@@ -384,4 +535,4 @@ def main():
 
 if __name__ == '__main__':
   main()
-  
+
