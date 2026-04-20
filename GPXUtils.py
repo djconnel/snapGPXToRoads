@@ -1,3 +1,13 @@
+"""GPXUtils is a series of procedures useful for processing GPX files,
+using the gpxp:y library.
+version histry:
+0.01: first release
+0.02: additional methods
+author: Daniel Connelly djconnel@gmail.com
+"""
+
+__version__ = 0.02
+
 from math import pi, cos, sin, sqrt, atan2, floor
 import gpxpy
 import gpxpy.gpx
@@ -11,10 +21,10 @@ deg2rad = pi / 180
 def load_gpx(gpx_file):
   """
   Load GPX file and extract all track points.
-  
+
   Args:
     filename: Path to the GPX file
-    
+
   Returns:
     List of (latitude, longitude) tuples
   """
@@ -26,7 +36,7 @@ def load_gpx(gpx_file):
     for segment in track.segments:
       for point in segment.points:
         points.append(point)
-  
+
   sys.stderr.write(f"Loaded {len(points)} points from GPX file\n")
   return points
 
@@ -58,7 +68,7 @@ def pointsAreVeryClose(p1, p2, deltaDegs= 1e-8, deltaZ= 0.001):
 
 def pointdxdy(p1, p2):
   """
-  Calculate the great circle distance in kilometers between two points 
+  Calculate the great circle distance in kilometers between two points
   on the earth (specified in decimal degrees)
   """
   # convert decimal degrees to radians
@@ -67,7 +77,7 @@ def pointdxdy(p1, p2):
   lon2 = p2.longitude * deg2rad
   lat2 = p2.latitude * deg2rad
 
-  # haversine formula 
+  # haversine formula
   dlon = lon2 - lon1
   dlon -= twopi * floor(0.5 + dlon / twopi)
   dlat = lat2 - lat1
@@ -89,7 +99,7 @@ def pointdxdy(p1, p2):
 
 def pointDistance(p1, p2):
   """
-  Calculate the great circle distance in kilometers between two points 
+  Calculate the great circle distance in kilometers between two points
   on the earth (specified in decimal degrees)
   """
   # convert decimal degrees to radians
@@ -98,7 +108,7 @@ def pointDistance(p1, p2):
   lon2 = p2.longitude * deg2rad
   lat2 = p2.latitude * deg2rad
 
-  # haversine formula 
+  # haversine formula
   dlon = lon2 - lon1
   dlon -= twopi * floor(0.5 + dlon / twopi)
   dlat = lat2 - lat1
@@ -150,13 +160,46 @@ def xyPointOnLine(xy1, xy2, xy3):
   d = sqrt( ( x1 - x3 + f * (x2 - x1) ) ** 2 + ( y1 - y3 + f * (y2 - y1) ) ** 2 )
   return ( f, d )
 
-
 def removeDuplicatePoints(points):
   newPoints = [ points[0] ]
   for p in points:
     if not pointsAreVeryClose(p, newPoints[-1]):
       newPoints.append(p)
   return newPoints
+
+def deltaPosition(d1, d2, courseDistance=None, isLoop=False):
+  delta = d2 - d1
+  if isLoop and courseDistance is not None and courseDistance > 0:
+    delta -= courseDistance * floor(0.5 + delta / courseDistance)
+  return delta
+
+def interpolatePosition(d1, d2, f = 0.5, courseDistance = None, isLoop = False):
+    dd = d2 - d1
+    if isLoop:
+      dd -= courseDistance * floor(0.5 + dd / courseDistance)
+    d = d1 + dd * f
+    if isLoop is courseDistance is not None:
+      d -= courseDistance * floor(0.5 + d / courseDistance)
+    return d
+
+def interpolateLon(lon1, lon2, f = 0.5):
+    dl = lon2 - lon1
+    dl -= 360 * floor(0.5 + dl / 360)
+    l = lon1 + f * dl
+    l -= 360 * floor(0.5 + l / 360)
+    return l
+
+def interpolateLat(lat1, lat2, f = 0.5):
+    dl = lat2 - lat1
+    l = lat1 + f * dl
+    return l
+
+def interpolatePoint(p1, p2, f):
+  p = copyPoint(p1)
+  p.latitude = interpolateLat(p1.latitude, p2.latitude, f)
+  p.longitude = interpolateLon(p1.longitude, p2.longitude, f)
+  p.elevation = (1 - f) * p1.elevation + f * p2.elevation
+  return p
 
 def simplifyPoints(points, z0 = 0.2, r0 = 1):
   if r0 <= 0 or len(points) < 3:

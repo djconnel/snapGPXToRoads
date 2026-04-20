@@ -3,9 +3,10 @@
 # version bistory:
 # 0.01: first release
 # 0.02: add GOOGLE_MAPS_API_KEY environemnt variable, provide help information, added RMS shift reporting
+# 0.03: fix bug w/ default input, add smoothing, add --loop option
 
 '''VERSION
-   0.02
+   0.03
 
 DESCRIPTION
 
@@ -85,6 +86,11 @@ smooth gradient.  So an offset is applied to the final point, and the
 offset is applied to all other points using a constant gradient
 adjustment between the first and last points.
 
+One thing to watch out for on loops is if the route extends beyond a
+single lap, with overlap.  In that case, the code will determine that
+it is not a loop.  So make sure the end of the loop doesn't overlap
+the start.
+
 Snap to roads tends to result in perturbations to a smooth gradient,
 For example, points which were initially separated by some distance,
 for example 5 to 10 meters typical for data from a bike computer, may
@@ -97,6 +103,16 @@ beneficial to smooth the data after snapping.  This can be done with a
 program like processGPX (https://processGPX.com, or
 https://github.com/djconnel/processGPX) or GPXMagic (Google search for
 URL).
+
+A rough alternative to using these tools is to apply some smoothing
+with the various -smooth options.  --smoothXY applies smoothing to
+positions, both x and y, with a Gaussian kernel of the specified σ.
+--smoothZ applies similar smoothing to elevation.  You can apply the
+same smoothing to both with --smoothXY.  --sigmaZ, --sigma, and
+--sigma are aliases.  A downside of smoothing is it can cause sharp
+corners to become "blunted".  This can result in switchbacks on climbs
+becoming too steep.  So more sophisticated approaches like those used
+in processGPX may be preferable.
 
 DEENDENCIES
 
@@ -125,7 +141,7 @@ LICENSE
 
 '''
 
-__version__ = 0.02
+__version__ = 0.03
 
 import argparse
 import gpxpy
@@ -133,6 +149,7 @@ import gpxpy.gpx
 import requests
 import sys
 import re
+from math import sqrt, exp, floor
 from sys import stderr, stdin, stdout
 from os import environ
 from GPXUtils import *
@@ -344,9 +361,265 @@ def fixLoopAltitudes(points):
     f = ds[i] / courseDistance
     points[i].elevation += dz * f
 
+def deltaPosition(d1, d2, courseDistance=None, isLoop=False):
+  delta = d2 - d1
+  if isLoop and courseDistance is not None and courseDistance > 0:
+    delta -= courseDistance * floor(0.5 + delta / courseDistance)
+  return delta
+
+def smoothPoints(points, smoothXY=0, smoothZ=0, isLoop=False):
+  '''smooth points with the given sigma values.  Loop courses wrap around.'''
+  stderr.write(f'smoothing with xy sigma = {smoothXY}, z sigmaZ = {smoothZ}, isLoop = {isLoop}\n')
+
+  if smoothXY is None or smoothXY < 0:
+    smoothXY = 0
+  if smoothZ is None or smoothZ < 0:
+    smoothZ = 0
+  if smoothXY <= 0 and smoothZ <= 0:
+    return
+
+  # calculate kernel
+  wList = [1]
+  for u in range(1, 41):
+    wList.append(exp(- u ** 2 / 200))
+
+  N = len(points)
+  # create distance field
+  ds = [0]
+  for i in range(N - 1):
+    ds.append(ds[-1] + pointDistance(points[i], points[i + 1]))
+  courseDistance = ds[-1]
+  if isLoop:
+    courseDistance += pointDistance(points[-1], points[0])
+
+
+  #
+  # refine the mesh: add mesh points proximate to points
+  #
+
+  # do refinements in order of refinement
+  sigmas = []
+  if smoothXY > 0:
+    sigmas.append(smoothXY)
+  if smoothZ > 0:
+    sigmas.append(smoothZ)
+  if len(sigmas) > 1:
+    if sigmas[0] < sigmas[1]:
+      s = sigmas[0]
+      sigmas[0] = sigmas[1]
+      sigmas[1] = s
+    # if the sigmas are similar, just use the broader sigma
+    if sigmas[0] < 1.2 * sigmas[1]:
+      sigmas = [sigmas[0]]
+
+  newPoints = [[[], []] for p in points]
+  newDs = [[[], []] for p in points]
+
+  # create refinement region in the zones around each point
+  regions = []    # list: for each sigma, for each point, 2 refinement region, each with 2 bounds
+  ns = 0
+  for sigma in sigmas:
+    regions.append([])
+    r = 2 * sigma
+    for i in range(N):
+      d = ds[i]
+      d1 = d - r
+      if not isLoop and d1 < 0:
+        d1 = 0
+      if isLoop or i > 0:
+       dMid = max(0, interpolatePosition(ds[i - 1], ds[i], 0.5, courseDistance, isLoop))   # midpoint between points
+       if d1 < dMid:
+         d1 = dMid
+      d2 = d + r
+      if not isLoop and d1 > courseDistance:
+        d1 = courseDistance
+      if isLoop or i < N - 1:
+       dMid = interpolatePosition(ds[i], ds[(i + 1) % N], 0.5, courseDistance, isLoop)   # midpoint between points
+       if d2 > dMid:
+         d2 = dMid
+      # refinement region for this spacing is from d1 to d2, retaining original point
+      regions[ns].append([[d1, d], [d, d2]])
+
+      # if there's an additional region, it gets split
+      for n in range(ns):
+        regions[n][i][0][1] = d1   # end of first region
+        regions[n][i][1][0] = d2   # start of 2nd region
+    ns += 1
+
+  nNewPoints = 0
+  for i in range(N):
+    # sigma regions prior to point
+    for ns in range(len(sigmas)):
+      spacing = sigmas[ns] / 2
+      d1 = regions[ns][i][0][0]
+      d2 = regions[ns][i][0][1]
+      NPoints = 1 + int((d2 - d1) / spacing)
+
+      # avoid close points at the boundary
+      n1 = 0
+      dMid = max(0, interpolatePosition(ds[i], ds[i - 1], 0.5, courseDistance, isLoop))   # midpoint between points
+      if abs(d1 - dMid) < spacing / 4:
+        n1 = 1
+
+      dd = deltaPosition(ds[i - 1], ds[i], courseDistance = courseDistance, isLoop = isLoop)
+      for n in range(n1, NPoints):
+        d = interpolatePosition(d1, d2, f= n / NPoints, courseDistance = courseDistance)
+        f = deltaPosition(ds[i - 1], d, courseDistance = courseDistance, isLoop = isLoop) / dd
+        newPoints[i][0].append(interpolatePoint(points[i - 1], points[i], f))
+        newDs[i][0].append(d)
+        nNewPoints += 1
+
+    # sigma regions after point
+    for ns in reversed(range(len(sigmas))):
+      spacing = sigmas[ns] / 2
+      d1 = regions[ns][i][1][0]
+      d2 = regions[ns][i][1][1]
+      NPoints = 1 + int((d2 - d1) / spacing)
+      dd = deltaPosition(ds[i], ds[(i + 1) % N], courseDistance = courseDistance, isLoop = isLoop)
+      for n in range(1, NPoints):
+        d = interpolatePosition(d1, d2, f= n / NPoints, courseDistance = courseDistance)
+        f = deltaPosition(ds[i], d, courseDistance = courseDistance, isLoop = isLoop) / dd
+        newPoints[i][1].append(interpolatePoint(points[i], points[(i + 1) % N], f))
+        newDs[i][1].append(d)
+        nNewPoints += 1
+
+      # revise possible duplicate points at the boundary
+      if isLoop or i < N - 1:
+        dMid = interpolatePosition(ds[i], ds[(i + 1) % N] , 0.5, courseDistance, isLoop)   # midpoint between points
+        # if we're close to the mid-point, use that instead
+        if len(newPoints[i][1]) > 0 and abs(d2 - dMid) < spacing / 4:
+          newPoints[i][1][-1] = interpolatePoint(points[i], points[(i + 1) % N], 0.5)
+      # end of point to point, don't put a point too close to the final point
+      if not isLoop and i == N - 1 and abs(d2 - courseDistance) < spacing / 4 and len(newPoints[i][1]) > 0:
+        newPoints[i][1].pop()
+        newDs[i][1].pop()
+        nNewPoints -= 1
+
+  # if we added new points, splice them in
+  # begore the first point goes at the end
+  if nNewPoints > 0:
+    pRefined = []
+    dRefined = []
+    for i in range(N):
+      if i > 0:
+        pRefined += newPoints[i][0]
+        dRefined += newDs[i][0]
+      pRefined += [points[i]] + newPoints[i][1]
+      dRefined += [ds[i]] + newDs[i][1]
+    pRefined += newPoints[0][0]
+    dRefined += newDs[0][0]
+    points = pRefined
+    ds = dRefined
+    N = len(points)
+
+  #
+  # do smoothing on refined mesh
+  #
+
+  newLats = []
+  newLons = []
+  newEles = []
+  if smoothXY > 0:
+    uXYs = [d / smoothXY for d in ds]
+    cdXY = courseDistance / smoothXY
+    j = 0
+    k = 0
+    if isLoop:
+      while ((j - 1) % N != i % N) and deltaPosition(uXYs[j], uXYs[i], cdXY, isLoop) < 3:
+        j = (j - 1) % N
+
+    lons = [points[0].longitude]   # avoid antimeridian problems
+    for i in range(N - 1):
+      dLon = points[i + 1].longitude - points[i].longitude
+      dLon -= 360 * floor(0.5 + dLon / 360)
+      lons.append(lons[-1] + dLon)
+
+    for i in range(N):
+      if isLoop:
+        iLast = (i - 1) % N
+      else:
+        iLast = N - 1
+      while (k % N != iLast) and deltaPosition(uXYs[i], uXYs[k], cdXY, isLoop) < 3:
+        k = (k + 1) % N
+      while (j % N != i) and deltaPosition(uXYs[(j + 1) % N], uXYs[i], cdXY, isLoop) > 3:
+        j = (j + 1) % N
+      # smooth from k to j
+      u = j
+      sumw = 0
+      sumLat = 0
+      sumLon = 0
+      while True:
+        d = deltaPosition(uXYs[u], uXYs[i], cdXY, isLoop)
+        nw = int(10 * abs(d) + 0.5)
+        w = wList[int(10 * abs(d) + 0.5)] if nw < len(wList) else 0
+        sumw += w
+        sumLat += w * points[u].latitude
+        sumLon += w * lons[u]
+        if u == k:
+          break
+        u = (u + 1) % N
+
+      lat = sumLat / sumw
+      lon = sumLon / sumw
+      lon -= 360 * floor(0.5 + lon / 360)
+      newLats.append(lat)
+      newLons.append(lon)
+
+  if (smoothZ > 0):
+    uZs = [d / smoothZ for d in ds]
+    cdZ = courseDistance / smoothZ
+    j = 0
+    k = 0
+    if isLoop:
+      while ((j - 1) % N != i % N) and deltaPosition(uZs[j], uZs[i], cdZ, isLoop) < 3:
+        j = (j - 1) % N
+
+    lons = [points[0].longitude]   # avoid antimeridian problems
+    for i in range(N - 1):
+      dLon = points[i + 1].longitude - points[i].longitude
+      dLon -= 360 * floor(0.5 + dLon / 360)
+      lons.append(lons[-1] + dLon)
+
+    for i in range(N):
+      if isLoop:
+        iLast = (i - 1) % N
+      else:
+        iLast = N - 1
+      while (k % N != iLast) and deltaPosition(uZs[i], uZs[k], cdZ, isLoop) < 3:
+        k = (k + 1) % N
+      while (j % N != i) and deltaPosition(uZs[(j + 1) % N], uZs[i], cdZ, isLoop) > 3:
+        j = (j + 1) % N
+      # smooth from k to j
+      u = j
+      sumw = 0
+      sumEle = 0
+      while True:
+        d = deltaPosition(uZs[u], uZs[i], cdZ, isLoop)
+        nw = int(10 * abs(d) + 0.5)
+        w = wList[int(10 * abs(d) + 0.5)] if nw < len(wList) else 0
+        sumw += w
+        sumEle += w * points[u].elevation
+        if u == k:
+          break
+        u = (u + 1) % N
+
+      ele = sumEle / sumw
+      newEles.append(ele)
+
+  if len(newLons) > 0:
+    for p, lat, lon  in zip(points, newLats, newLons):
+      p.latitude = lat
+      p.longitude = lon
+
+  if len(newEles) > 0:
+    for p, ele  in zip(points, newEles):
+      p.elevation = ele
+
+  return points
+
 def export_gpx(points, output_file, input_file):
   '''
-  Export snapped points to a new GPX file.
+  Export snappped points to a new GPX file.
 
   Args:
     points: List GPX points
@@ -382,7 +655,6 @@ def export_gpx(points, output_file, input_file):
   output_file.write(gpx.to_xml())
 
   stderr.write(f'Successfully exported {len(points)} points\n')
-
 
 
 def main():
@@ -437,10 +709,31 @@ def main():
 
   parser.add_argument(
     '-l', '--loop',
-    action=argparse.BooleanOptionalAction,
     default=None,
     help='specify that the course is m loop.  This is normally determined automatically.  Specify no loop with --no-loop.',
   )
+
+  parser.add_argument(
+    '--smoothXY', '--sigmaXY', '--smoothxy', '--sigmaxy',
+    type=float,
+    default=0,
+    help='smoothing distance applied to positions (default = 0)',
+  )
+
+  parser.add_argument(
+    '--smoothZ', '--sigmaZ', '--smoothz', '--sigmaz',
+    type=float,
+    default=0,
+    help='smoothing distance applied to elevations (default = 0)',
+  )
+
+  parser.add_argument(
+    '--smooth', '--sigma',
+    type=float,
+    default=0,
+    help='smoothing distance applied to both elevations and positions elevations (default = 0)',
+  )
+
 
   args = parser.parse_args()
 
@@ -452,7 +745,9 @@ def main():
   simplify = args.simplify
   isLoop = args.loop
   api_key = args.apikey
-  stderr.write(f'input_file = {input_file}\noutput_file = {output_file}\ninterpolate = {interpolate}\napi_key = {api_key}\n')
+  smoothZ = sqrt(args.smoothZ ** 2 + args.smooth ** 2)
+  smoothXY = sqrt(args.smoothXY ** 2 + args.smooth ** 2)
+  stderr.write(f'input_file = {input_file}\noutput_file = {output_file}\ninterpolate = {interpolate}\napi_key = {api_key}, isLoop = {isLoop}\n')
 
   if isinstance(input_file, str):
     if input_file == '-':
@@ -463,6 +758,8 @@ def main():
         input_file = open(input_file, 'r')
       except:
         stderr.write('Error opening file ' + input_file + '\n')
+  else:
+    input_file = stdin
   if isinstance(output_file, str):
     if output_file == '-':
       output_file = stdout
@@ -492,6 +789,8 @@ def main():
 
     if isLoop is None:
       isLoop = checkLoop(points = points)
+      stderr.write(f'auto-setting isLoop = {isLoop}\n')
+
     if isLoop:
       stderr.write('The route is a circuit\n')
       if not pointsAreClose(points[0], points[-1]):
@@ -517,7 +816,10 @@ def main():
       if isLoop:
         fixLoopAltitudes(points = snapped_points)
 
-      # step 5: export points
+      # step 5: smooth points
+      snapped_points = smoothPoints(points= snapped_points, smoothXY= smoothXY, smoothZ= smoothZ, isLoop= isLoop)
+
+      # step 6: export points
       export_gpx(points= snapped_points, output_file = output_file, input_file = input_file)
 
 
