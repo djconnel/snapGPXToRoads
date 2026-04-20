@@ -4,9 +4,10 @@
 # 0.01: first release
 # 0.02: add GOOGLE_MAPS_API_KEY environemnt variable, provide help information, added RMS shift reporting
 # 0.03: fix bug w/ default input, add smoothing, add --loop option
+# 0.04: modified command line options, adding default smoothing, and --snap, fixed smoothing bug on pt-to-pt
 
 '''VERSION
-   0.03
+   0.04
 
 DESCRIPTION
 
@@ -60,8 +61,8 @@ route is simplified first using a recursive algorithm.  However, if
 you do not want this simplification step, specify the --no-simplify
 option.  It can be explicitly turned on with the --simplify option (or
 -s), not typically needed.  To test the simplification step without
-any point snapping, specify --simplifyOnly (or -S) The GPX file will
-contain only simplified points without any shift.
+any point snapping, specify --no-snap. The GPX file will contain only
+simplified points without any shift.
 
 Google snap to roads has two modes: with or without interpolation.
 Without interpolation it snaps only the points in the input file,
@@ -112,7 +113,14 @@ same smoothing to both with --smoothXY.  --sigmaZ, --sigma, and
 --sigma are aliases.  A downside of smoothing is it can cause sharp
 corners to become "blunted".  This can result in switchbacks on climbs
 becoming too steep.  So more sophisticated approaches like those used
-in processGPX may be preferable.
+in processGPX may be preferable.  If the same value is to be used for
+each, this can be specifies with --smoothing.  A short-cut option for
+smoothing is --smooth, which uses reasonable defaults for the
+smoothing terms.
+
+If you want to just smooth and not snap, use the --no-snap option.
+Snapping is on by default, and this turns it on.  There's also a --snap
+option which explicitly states that snapping will happen.
 
 DEENDENCIES
 
@@ -141,7 +149,7 @@ LICENSE
 
 '''
 
-__version__ = 0.03
+__version__ = 0.04
 
 import argparse
 import gpxpy
@@ -378,7 +386,6 @@ def smoothPoints(points, smoothXY=0, smoothZ=0, isLoop=False):
   if smoothXY <= 0 and smoothZ <= 0:
     return
 
-  # calculate kernel
   wList = [1]
   for u in range(1, 41):
     wList.append(exp(- u ** 2 / 200))
@@ -496,7 +503,7 @@ def smoothPoints(points, smoothXY=0, smoothZ=0, isLoop=False):
         nNewPoints -= 1
 
   # if we added new points, splice them in
-  # begore the first point goes at the end
+  # before the first point goes at the end
   if nNewPoints > 0:
     pRefined = []
     dRefined = []
@@ -506,8 +513,9 @@ def smoothPoints(points, smoothXY=0, smoothZ=0, isLoop=False):
         dRefined += newDs[i][0]
       pRefined += [points[i]] + newPoints[i][1]
       dRefined += [ds[i]] + newDs[i][1]
-    pRefined += newPoints[0][0]
-    dRefined += newDs[0][0]
+    if isLoop:
+      pRefined += newPoints[0][0]
+      dRefined += newDs[0][0]
     points = pRefined
     ds = dRefined
     N = len(points)
@@ -687,17 +695,17 @@ def main():
   )
 
   parser.add_argument(
+    '--snap',
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help='Specify snapping should be done, which is the default',
+  )
+
+  parser.add_argument(
     '-I', '--interpolate',
     action=argparse.BooleanOptionalAction,
     default=True,
     help='Enable or disable interpolation (optional, default: True).',
-  )
-
-  parser.add_argument(
-    '-S', '--simplifyOnly',
-    action=argparse.BooleanOptionalAction,
-    default=False,
-    help='simplifies the route but does not snap it',
   )
 
   parser.add_argument(
@@ -716,37 +724,56 @@ def main():
   parser.add_argument(
     '--smoothXY', '--sigmaXY', '--smoothxy', '--sigmaxy',
     type=float,
-    default=0,
+    default=None,
     help='smoothing distance applied to positions (default = 0)',
   )
 
   parser.add_argument(
     '--smoothZ', '--sigmaZ', '--smoothz', '--sigmaz',
     type=float,
-    default=0,
+    default=None,
     help='smoothing distance applied to elevations (default = 0)',
   )
 
   parser.add_argument(
-    '--smooth', '--sigma',
+    '--smoothing', '--sigma',
     type=float,
     default=0,
     help='smoothing distance applied to both elevations and positions elevations (default = 0)',
   )
 
+  parser.add_argument(
+    '--smooth',
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help='specifies default smoothing',
+  )
 
   args = parser.parse_args()
 
   # --- Access the parsed values ---
   input_file = args.input
   output_file = args.output
+  snap = args.snap
   interpolate = args.interpolate
-  simplifyOnly = args.simplifyOnly
   simplify = args.simplify
   isLoop = args.loop
   api_key = args.apikey
-  smoothZ = sqrt(args.smoothZ ** 2 + args.smooth ** 2)
-  smoothXY = sqrt(args.smoothXY ** 2 + args.smooth ** 2)
+  if args.smooth:
+    smoothXY = args.smooth
+    smoothZ  = 12
+  if smoothXY is None:
+    if args.smoothXY is None:
+      smoothXY = 0
+    else:
+      smoothXY = args.smoothZ
+  if smoothZ is None:
+    if args.smoothZ is None:
+      smoothZ = 0
+    else:
+      smoothZ = args.smoothZ
+  smoothXY = sqrt(smoothXY ** 2 + args.smoothing ** 2)
+  smoothZ  = sqrt(smoothZ ** 2 + args.smoothing ** 2)
   stderr.write(f'input_file = {input_file}\noutput_file = {output_file}\ninterpolate = {interpolate}\napi_key = {api_key}, isLoop = {isLoop}\n')
 
   if isinstance(input_file, str):
@@ -805,23 +832,19 @@ def main():
       points = simplifyPoints(points= points)
       stderr.write(f'simplified points = {len(points)}\n')
 
-    if simplifyOnly:
-      # Step 3: export points
-      export_gpx(points= points, output_file = output_file, input_file = input_file)
-    else:
+    if snap:
       # Step 3: Snap points to roads
-      snapped_points = snap_to_roads(points = points, api_key = api_key, interpolate= interpolate, isLoop= isLoop)
+      points = snap_to_roads(points = points, api_key = api_key, interpolate= interpolate, isLoop= isLoop)
 
-      # step 4: make sure altitudes are smooth (if it's a loop course)
-      if isLoop:
-        fixLoopAltitudes(points = snapped_points)
+    # step 4: make sure altitudes are smooth (if it's a loop course)
+    if isLoop:
+      fixLoopAltitudes(points = snapped_points)
 
-      # step 5: smooth points
-      snapped_points = smoothPoints(points= snapped_points, smoothXY= smoothXY, smoothZ= smoothZ, isLoop= isLoop)
+    # step 5: smooth points
+    points = smoothPoints(points= points, smoothXY= smoothXY, smoothZ= smoothZ, isLoop= isLoop)
 
-      # step 6: export points
-      export_gpx(points= snapped_points, output_file = output_file, input_file = input_file)
-
+    # step 6: export points
+    export_gpx(points= points, output_file = output_file, input_file = input_file)
 
     stderr.write('\n✓ Process completed successfully!\n')
 
