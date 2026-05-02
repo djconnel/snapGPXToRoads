@@ -4,10 +4,11 @@
 # 0.01: first release
 # 0.02: add GOOGLE_MAPS_API_KEY environemnt variable, provide help information, added RMS shift reporting
 # 0.03: fix bug w/ default input, add smoothing, add --loop option
-# 0.04: modified command line options, adding default smoothing, and --snap, fixed smoothing bug on pt-to-pt
+# 0.04: modified command line options, adding default smoothing, added --snap, fixed smoothing bug on pt-to-pt
+# 0.05: fixed altitude adjustment error, add corner cropping, remove coincident points
 
 '''VERSION
-   0.04
+   0.05
 
 DESCRIPTION
 
@@ -55,14 +56,11 @@ For example, a 5 hour activity with one point per second has 18
 thousand points.  This would be 180 API calls, 3.6% of the monthly
 limit.
 
-However, typically this large number of points is not needed.  To
-reduce the number of points and therefore the number of API calls, the
-route is simplified first using a recursive algorithm.  However, if
-you do not want this simplification step, specify the --no-simplify
-option.  It can be explicitly turned on with the --simplify option (or
--s), not typically needed.  To test the simplification step without
-any point snapping, specify --no-snap. The GPX file will contain only
-simplified points without any shift.
+The program may simplify the original route using a
+Ramer–Douglas–Peucker algorithm.  The default is to do simplification
+if snapping is done, but to not do it otherwise.  You can explicity
+turn on or off simplification with the --simplify or --no-simplify
+options.
 
 Google snap to roads has two modes: with or without interpolation.
 Without interpolation it snaps only the points in the input file,
@@ -122,6 +120,17 @@ If you want to just smooth and not snap, use the --no-snap option.
 Snapping is on by default, and this turns it on.  There's also a --snap
 option which explicitly states that snapping will happen.
 
+Another option, strongly recommended for preparing GPX files for a
+cycling simulation like BikeTerra, is "corner cropping", which can be
+accessed with the --cornerCrop option.  This replaces abrupt sharp
+corners with points before and after the corner, then fits a circular
+arc to the corner.  The default "cropping" distance is 6 meters.  To
+use a different distance apply the -cornerCropping option instead.
+Corner cropping reduces the required amount of smoothing, but a light
+smoothing in addition to corner cropping helps.  If you specify
+smoothing with --smooth, then the default position smoothing is
+reduced if --cornerCrop or --cornerCropping are specified.
+
 DEENDENCIES
 
 The following python libraries are used:
@@ -149,11 +158,10 @@ LICENSE
 
 '''
 
-__version__ = 0.04
+__version__ = 0.05
 
 import argparse
 import gpxpy
-import gpxpy.gpx
 import requests
 import sys
 import re
@@ -359,7 +367,7 @@ def fixLoopAltitudes(points):
   p3 = points[0]
   ds = [0]
   for i in range(1, len(points)):
-    ds.append(pointDistance(points[i - 1], points[i]))
+    ds.append(ds[-1] + pointDistance(points[i - 1], points[i]))
 
   courseDistance = ds[-1] + pointDistance(p2, p3)
   f = (ds[-1] - ds[-2]) / courseDistance
@@ -375,6 +383,190 @@ def deltaPosition(d1, d2, courseDistance=None, isLoop=False):
     delta -= courseDistance * floor(0.5 + delta / courseDistance)
   return delta
 
+
+def cropCorners(points, cropping = None, isLoop = False, courseDistance = None, start = None, end = None):
+  if cropping is None or cropping <= 0:
+    return point
+
+  # remove duplicate points at end (can re-add them later)
+  endPoints = []
+  if isLoop:
+    while len(points) > 0 and pointsAreClose(points[0], points[-1]):
+      endPoints.append(points.pop())
+    endPoints.reverse()
+
+  N = len(points)
+  if N == 0:
+    return points
+  
+  ds = [0]
+  for i in range(1, len(points)):
+    ds.append(ds[-1] + pointDistance(points[i - 1], points[i]))
+
+  if courseDistance is None:
+    courseDistance = ds[-1]
+  if isLoop:
+    courseDistance += pointDistance(points[-1], points[0])
+  
+  # find corner candidates
+  cornerPoints = []
+  for i in range(N):
+    p = points[i]
+    if not isLoop and (i == 1 or i == N - 1):
+      continue
+    p1 = points[i - 1]
+    p2 = points[(i + 1) % N]
+    d1 = ds[i - 1]
+    d2 = ds[(i + 1) % N]
+    d  = ds[i]
+    dd1 = deltaPosition(d1, d, courseDistance= courseDistance, isLoop= isLoop)
+    dd2 = deltaPosition(d, d2, courseDistance= courseDistance, isLoop= isLoop)
+    if dd1 == 0 or dd2 == 0:
+      stderr.write(f'coincident points found!\n')
+      sys.exit()
+    cross = pointNormalizedCross(p1, p, p, p2)
+    if abs(cross) > 0.5:
+      cornerPoints.append(i)
+
+  stderr.write(f'initial cornerPoints = {cornerPoints}\n')
+  # corners which are too close get pruned
+  dMin = 2 * cropping
+  cc = [];
+  for ic in range(len(cornerPoints)):
+    d = ds[cornerPoints[ic]]
+    if not isLoop and ic == 0:
+      dPrev = 0
+    else:
+      dPrev = ds[cornerPoints[ic - 1]]
+      if ic == 0:
+        dPrev -= courseDistance
+    if not isLoop and ic == len(cornerPoints) - 1:
+      dNext = ds[-1]
+    else:
+      dNext = ds[cornerPoints[(ic + 1) % len(cornerPoints)]]
+      if ic == len(cornerPoints) - 1:
+        dNext += courseDistance
+
+    # pass criteria:
+    # 1. point is in limits defined by start and/or stop (if isLoop, start can be > stop)
+    # 2. corner is sufficiently far from neighbor corners (or for point-to-point, course terminals)
+    flag = True
+    if isLoop and start is not None and end is not None and end < start:
+      flag &= d >= end and d <= start
+    else:
+      if start is not None:
+        flag &= d >= start
+      if end is not None:
+        flag &= d <= end
+    flag &= dNext > d + dMin and dPrev <= d - dMin
+    if flag:
+      cc.append(cornerPoints[ic])
+      
+  cornerPoints = cc;
+
+  if len(cornerPoints) == 0:
+    return points + endPoints
+
+  # keep track of corner points with pruning
+  isCornerPoint = [False] * N
+  for ic in cornerPoints:
+    isCornerPoint[ic] = True
+
+  skipPoint = [False] * N
+
+  for i in range(N):
+    if not isLoop and (i == 1 or i == N - 1):
+      continue
+
+    # this is corner to be cropped
+    if isCornerPoint[i]:
+      d0 = ds[i]
+      dc1 = d0 - cropping + 0.01
+      dc2 = d0 + cropping - 0.01
+
+      # find the interval spanning the crop point
+      j = (i - 1) % N
+      while j != (i if isLoop else 0):
+        d1 = ds[j]
+        while d1 > d0:
+          d1 -= courseDistance
+        if d1 < dc1:
+          break
+        skipPoint[j] = True
+        j = (j - 1) % N
+
+      j = (i + 1) % N
+      while j != (i if isLoop else len(points) - 1):
+        d1 = ds[j]
+        while d1 < d0:
+          d2 += courseDistance
+        if d1 > dc2:
+          break
+        skipPoint[j] = True
+        j = (j + 1) % N
+
+  newPoints = []
+  for i in range(N):
+    p = points[i]
+    d = ds[i]
+    if skipPoint[i]:
+      continue
+    elif isCornerPoint[i]:
+      j = (i - 1) % N
+      while skipPoint[j]:
+        j = (j - 1) % N
+      p1a = points[j]
+      d1a = ds[j]
+      p1b = points[(j + 1) % N]
+      d1b = ds[(j + 1) % N]
+      k = (i + 1) % N
+      while skipPoint[k]:
+        k = (k + 1) % N
+      p2a = points[k - 1]
+      d2a = ds[k - 1]
+      p2b = points[k]
+      d2b = ds[k]
+        
+      # back up until we reach the crop distance
+      dd1a = deltaPosition(d1a, d, courseDistance= courseDistance, isLoop= isLoop)
+      dd1b = deltaPosition(d1b, d, courseDistance= courseDistance, isLoop= isLoop)
+      dd2a = deltaPosition(d, d2a, courseDistance= courseDistance, isLoop= isLoop)
+      dd2b = deltaPosition(d, d2b, courseDistance= courseDistance, isLoop= isLoop)
+
+      f1 = (dd1a - cropping) / (dd1a - dd1b)
+      f2 = (cropping - dd2a) / (dd2b - dd2a)
+      addPoints = []
+      if f1 > 0.01 / cropping:
+        p1b = interpolatePoint(p1a, p1b, f1)
+        newPoints.append(p1b)
+        
+      if f2 < 1 - 0.01 / cropping:
+        p2a = interpolatePoint(p2a, p2b, f1)
+        addPoints.append(p2a)
+
+      pArc = arcFit(p1a, p1b, p2a, p2b, maxRadius = cropping) + addPoints
+
+      if k < j:
+        # this wraps around, so either first point is a corner point, or the last point
+        iMid = (len(pArc) - 1) // 2
+        pArc1 = pArc[:iMid]
+        pArc2 = pArc[iMid:]
+        if i == 0:
+          endPoints = pArc1
+          newPoints = pArc2
+        else:
+          newPoints = pArc2 + newPoints + pArc1
+          endPoints = []
+      else:
+        newPoints += pArc
+    else:
+      newPoints.append(p)
+
+  newPoints += endPoints
+
+  stderr.write(f'points after cropping = {len(newPoints)}\n')
+  return newPoints
+
 def smoothPoints(points, smoothXY=0, smoothZ=0, isLoop=False):
   '''smooth points with the given sigma values.  Loop courses wrap around.'''
   stderr.write(f'smoothing with xy sigma = {smoothXY}, z sigmaZ = {smoothZ}, isLoop = {isLoop}\n')
@@ -384,7 +576,7 @@ def smoothPoints(points, smoothXY=0, smoothZ=0, isLoop=False):
   if smoothZ is None or smoothZ < 0:
     smoothZ = 0
   if smoothXY <= 0 and smoothZ <= 0:
-    return
+    return points
 
   wList = [1]
   for u in range(1, 41):
@@ -651,7 +843,10 @@ def export_gpx(points, output_file, input_file):
   # Create a track and segment
   gpx_track = gpxpy.gpx.GPXTrack()
   gpx.tracks.append(gpx_track)
-  gpx_track.name = 'Snapped Track'
+  try:
+    gpx_track.name = original_gpx.tracks[0].name
+  except:
+    pass
 
   gpx_segment = gpxpy.gpx.GPXTrackSegment()
   gpx_track.segments.append(gpx_segment)
@@ -711,7 +906,7 @@ def main():
   parser.add_argument(
     '-s', '--simplify',
     action=argparse.BooleanOptionalAction,
-    default=True,
+    default=None,
     help='whether the simplificatin algorithm is used before snapping to reduce the number of API calls',
   )
 
@@ -738,7 +933,7 @@ def main():
   parser.add_argument(
     '--smoothing', '--sigma',
     type=float,
-    default=0,
+    default=None,
     help='smoothing distance applied to both elevations and positions elevations (default = 0)',
   )
 
@@ -749,6 +944,20 @@ def main():
     help='specifies default smoothing',
   )
 
+  parser.add_argument(
+    '--cornerCropping',
+    type=float,
+    default=None,
+    help='smoothing distance applied to positions (default = 0)',
+  )
+
+  parser.add_argument(
+    '--cornerCrop',
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help='smoothing distance applied to positions (default = 0)',
+  )
+
   args = parser.parse_args()
 
   # --- Access the parsed values ---
@@ -757,23 +966,42 @@ def main():
   snap = args.snap
   interpolate = args.interpolate
   simplify = args.simplify
+  if simplify is None:
+    simplify =  snap
   isLoop = args.loop
   api_key = args.apikey
-  if args.smooth:
-    smoothXY = args.smooth
-    smoothZ  = 12
-  if smoothXY is None:
-    if args.smoothXY is None:
+  cornerCropping = args.cornerCropping
+  if cornerCropping is None:
+    if args.cornerCrop:
+      cornerCropping = 6
+    else:
+      cornerCropping = 0
+  if args.smoothXY is None:
+    if args.smoothing is None:
+      if args.smooth:
+        if cornerCropping > 0:
+          smoothXY = 3
+        else:
+          smoothXY = 5
+      else:
+        smoothXY = 0
+    else:
       smoothXY = 0
+  else:
+    smoothXY = args.smoothXY
+  if args.smoothZ is None:
+    if args.smoothing is None:
+      if args.smooth:
+        smoothZ = 12
+      else:
+        smoothZ = 0
     else:
-      smoothXY = args.smoothZ
-  if smoothZ is None:
-    if args.smoothZ is None:
       smoothZ = 0
-    else:
-      smoothZ = args.smoothZ
-  smoothXY = sqrt(smoothXY ** 2 + args.smoothing ** 2)
-  smoothZ  = sqrt(smoothZ ** 2 + args.smoothing ** 2)
+  else:
+    smoothZ = args.smoothZ
+  if args.smoothing is not None and args.smoothing > 0:
+    smoothXY = sqrt(smoothXY ** 2 + args.smoothing ** 2)
+    smoothZ  = sqrt(smoothZ ** 2 + args.smoothing ** 2)
   stderr.write(f'input_file = {input_file}\noutput_file = {output_file}\ninterpolate = {interpolate}\napi_key = {api_key}, isLoop = {isLoop}\n')
 
   if isinstance(input_file, str):
@@ -822,8 +1050,6 @@ def main():
       stderr.write('The route is a circuit\n')
       if not pointsAreClose(points[0], points[-1]):
         points.append(copyPoint(points[-1]))
-      else:
-        stderr.write('The route is not a circuit\n')
 
     stderr.write(f'initial points = {len(points)}\n')
 
@@ -832,18 +1058,25 @@ def main():
       points = simplifyPoints(points= points)
       stderr.write(f'simplified points = {len(points)}\n')
 
+    # Step 3: remove coincident points
+    points = averageCoincidentPoints(points)
+
     if snap:
-      # Step 3: Snap points to roads
-      points = snap_to_roads(points = points, api_key = api_key, interpolate= interpolate, isLoop= isLoop)
+      # Step 4: Snap points to roads
+      points = averageCoincidentPoints(snap_to_roads(points = points, api_key = api_key, interpolate= interpolate, isLoop= isLoop))
 
-    # step 4: make sure altitudes are smooth (if it's a loop course)
+    # step 5: crop corners
+    if cornerCropping > 0:
+      points = cropCorners(points= points, cropping= cornerCropping, isLoop= isLoop)
+
+    # step 6: make sure altitudes are smooth (if it's a loop course)
     if isLoop:
-      fixLoopAltitudes(points = snapped_points)
+      fixLoopAltitudes(points = points)
 
-    # step 5: smooth points
+    # step 7: smooth points
     points = smoothPoints(points= points, smoothXY= smoothXY, smoothZ= smoothZ, isLoop= isLoop)
 
-    # step 6: export points
+    # step 8: export points
     export_gpx(points= points, output_file = output_file, input_file = input_file)
 
     stderr.write('\n✓ Process completed successfully!\n')
