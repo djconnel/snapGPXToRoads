@@ -6,9 +6,13 @@
 # 0.03: fix bug w/ default input, add smoothing, add --loop option
 # 0.04: modified command line options, adding default smoothing, added --snap, fixed smoothing bug on pt-to-pt
 # 0.05: fixed altitude adjustment error, add corner cropping, remove coincident points
+# 0.06: moved various functions to gpxutils, added minRadius, added --postSimplify, added --auto, smarter defaults
+#       refinement applied to entire route for smoothing, zig-zag fix, check for loops
+#
+# author: Daniel Connelly djconnel@gmail.com
 
 '''VERSION
-   0.05
+   0.06
 
 DESCRIPTION
 
@@ -61,6 +65,13 @@ Ramer–Douglas–Peucker algorithm.  The default is to do simplification
 if snapping is done, but to not do it otherwise.  You can explicity
 turn on or off simplification with the --simplify or --no-simplify
 options.
+
+To apply this algorithm at the end of the process, use the
+--postSimplify option.  This is not as aggressive as the simplify
+which is done before snapping.  It will substantially reduce the
+number of points in the file, so is good practice.  If is
+the default if smoothing is done, but can be explicitly turned
+off with --no-postSimplify.
 
 Google snap to roads has two modes: with or without interpolation.
 Without interpolation it snaps only the points in the input file,
@@ -131,6 +142,15 @@ smoothing in addition to corner cropping helps.  If you specify
 smoothing with --smooth, then the default position smoothing is
 reduced if --cornerCrop or --cornerCropping are specified.
 
+To set the minimum radius of corners, use the --minRadius option with
+a number in meters.  Thsi option will also change the defaults for
+corner cropping and smoothing, since minimum radius adjustment works
+best with both corner cropping and at least light point smoothing.
+
+Finally there is an --auto option, which specifies that by default
+snapping, corner cropping, minimum radius, and smoothing will all be
+done.
+
 DEENDENCIES
 
 The following python libraries are used:
@@ -147,7 +167,7 @@ The following python libraries are used:
 
 * os: general operating system functions
 
-* GPXUtils : a library provided in this project.
+* gpxutils version 0.05: a library provided in this project.
      Install it somewhere in PYTHONPATH.
 
 AUTHORS
@@ -158,8 +178,6 @@ LICENSE
 
 '''
 
-__version__ = 0.05
-
 import argparse
 import gpxpy
 import requests
@@ -167,9 +185,11 @@ import sys
 import re
 from math import sqrt, exp, floor
 from sys import stderr, stdin, stdout
-from os import environ
-from GPXUtils import *
+from os import environ, path
+from gpxutils import *
 
+__version__ = '0.06'
+progName = path.basename(sys.argv[0])
 
 # Configuration
 API_KEY_RE = r'[a-zA-Z0-9]{39}'
@@ -215,7 +235,7 @@ def snap_to_roads_position(points, api_key, isLoop = False, interpolate = False)
   stderr.write(f'Snapping {len(points)} points to roads in {total_batches} batches...\n')
 
   batch_num = 0
-  for i in range(0, len(points), BATCH_SIZE - 1):
+  for i in range(0, len(points) - 1, BATCH_SIZE - 1):
     batch_num += 1
     batch = points[i:i + BATCH_SIZE]
 
@@ -348,6 +368,7 @@ def snap_to_roads(points, api_key, isLoop = False, interpolate = False):
     ds = [0]
     for k in range(i - 1, j):
       ds.append(ds[-1] + pointDistance(snappedPoints[k], snappedPoints[k + 1]))
+
     for k in range(i, j):
       f = ds[1 + k - i] / ds[1 + j - i]
       z = z1 * (1 - f) + z2 * f
@@ -359,463 +380,6 @@ def snap_to_roads(points, api_key, isLoop = False, interpolate = False):
     stderr.write(f'RMS point shift = {rmsd:g} meters\n')
 
   return snappedPoints
-
-def fixLoopAltitudes(points):
-  '''make sure altitudes are smooth at S/F for loop course'''
-  p1 = points[-2]
-  p2 = points[-1]
-  p3 = points[0]
-  ds = [0]
-  for i in range(1, len(points)):
-    ds.append(ds[-1] + pointDistance(points[i - 1], points[i]))
-
-  courseDistance = ds[-1] + pointDistance(p2, p3)
-  f = (ds[-1] - ds[-2]) / courseDistance
-  z = points[-2].elevation * (1 - f) + points[0].elevation * f
-  dz = z - points[-1].elevation
-  for i in range(len(points)):
-    f = ds[i] / courseDistance
-    points[i].elevation += dz * f
-
-def deltaPosition(d1, d2, courseDistance=None, isLoop=False):
-  delta = d2 - d1
-  if isLoop and courseDistance is not None and courseDistance > 0:
-    delta -= courseDistance * floor(0.5 + delta / courseDistance)
-  return delta
-
-
-def cropCorners(points, cropping = None, isLoop = False, courseDistance = None, start = None, end = None):
-  if cropping is None or cropping <= 0:
-    return point
-
-  # remove duplicate points at end (can re-add them later)
-  endPoints = []
-  if isLoop:
-    while len(points) > 0 and pointsAreClose(points[0], points[-1]):
-      endPoints.append(points.pop())
-    endPoints.reverse()
-
-  N = len(points)
-  if N == 0:
-    return points
-  
-  ds = [0]
-  for i in range(1, len(points)):
-    ds.append(ds[-1] + pointDistance(points[i - 1], points[i]))
-
-  if courseDistance is None:
-    courseDistance = ds[-1]
-  if isLoop:
-    courseDistance += pointDistance(points[-1], points[0])
-  
-  # find corner candidates
-  cornerPoints = []
-  for i in range(N):
-    p = points[i]
-    if not isLoop and (i == 1 or i == N - 1):
-      continue
-    p1 = points[i - 1]
-    p2 = points[(i + 1) % N]
-    d1 = ds[i - 1]
-    d2 = ds[(i + 1) % N]
-    d  = ds[i]
-    dd1 = deltaPosition(d1, d, courseDistance= courseDistance, isLoop= isLoop)
-    dd2 = deltaPosition(d, d2, courseDistance= courseDistance, isLoop= isLoop)
-    if dd1 == 0 or dd2 == 0:
-      stderr.write(f'coincident points found!\n')
-      sys.exit()
-    cross = pointNormalizedCross(p1, p, p, p2)
-    if abs(cross) > 0.5:
-      cornerPoints.append(i)
-
-  stderr.write(f'initial cornerPoints = {cornerPoints}\n')
-  # corners which are too close get pruned
-  dMin = 2 * cropping
-  cc = [];
-  for ic in range(len(cornerPoints)):
-    d = ds[cornerPoints[ic]]
-    if not isLoop and ic == 0:
-      dPrev = 0
-    else:
-      dPrev = ds[cornerPoints[ic - 1]]
-      if ic == 0:
-        dPrev -= courseDistance
-    if not isLoop and ic == len(cornerPoints) - 1:
-      dNext = ds[-1]
-    else:
-      dNext = ds[cornerPoints[(ic + 1) % len(cornerPoints)]]
-      if ic == len(cornerPoints) - 1:
-        dNext += courseDistance
-
-    # pass criteria:
-    # 1. point is in limits defined by start and/or stop (if isLoop, start can be > stop)
-    # 2. corner is sufficiently far from neighbor corners (or for point-to-point, course terminals)
-    flag = True
-    if isLoop and start is not None and end is not None and end < start:
-      flag &= d >= end and d <= start
-    else:
-      if start is not None:
-        flag &= d >= start
-      if end is not None:
-        flag &= d <= end
-    flag &= dNext > d + dMin and dPrev <= d - dMin
-    if flag:
-      cc.append(cornerPoints[ic])
-      
-  cornerPoints = cc;
-
-  if len(cornerPoints) == 0:
-    return points + endPoints
-
-  # keep track of corner points with pruning
-  isCornerPoint = [False] * N
-  for ic in cornerPoints:
-    isCornerPoint[ic] = True
-
-  skipPoint = [False] * N
-
-  for i in range(N):
-    if not isLoop and (i == 1 or i == N - 1):
-      continue
-
-    # this is corner to be cropped
-    if isCornerPoint[i]:
-      d0 = ds[i]
-      dc1 = d0 - cropping + 0.01
-      dc2 = d0 + cropping - 0.01
-
-      # find the interval spanning the crop point
-      j = (i - 1) % N
-      while j != (i if isLoop else 0):
-        d1 = ds[j]
-        while d1 > d0:
-          d1 -= courseDistance
-        if d1 < dc1:
-          break
-        skipPoint[j] = True
-        j = (j - 1) % N
-
-      j = (i + 1) % N
-      while j != (i if isLoop else len(points) - 1):
-        d1 = ds[j]
-        while d1 < d0:
-          d2 += courseDistance
-        if d1 > dc2:
-          break
-        skipPoint[j] = True
-        j = (j + 1) % N
-
-  newPoints = []
-  for i in range(N):
-    p = points[i]
-    d = ds[i]
-    if skipPoint[i]:
-      continue
-    elif isCornerPoint[i]:
-      j = (i - 1) % N
-      while skipPoint[j]:
-        j = (j - 1) % N
-      p1a = points[j]
-      d1a = ds[j]
-      p1b = points[(j + 1) % N]
-      d1b = ds[(j + 1) % N]
-      k = (i + 1) % N
-      while skipPoint[k]:
-        k = (k + 1) % N
-      p2a = points[k - 1]
-      d2a = ds[k - 1]
-      p2b = points[k]
-      d2b = ds[k]
-        
-      # back up until we reach the crop distance
-      dd1a = deltaPosition(d1a, d, courseDistance= courseDistance, isLoop= isLoop)
-      dd1b = deltaPosition(d1b, d, courseDistance= courseDistance, isLoop= isLoop)
-      dd2a = deltaPosition(d, d2a, courseDistance= courseDistance, isLoop= isLoop)
-      dd2b = deltaPosition(d, d2b, courseDistance= courseDistance, isLoop= isLoop)
-
-      f1 = (dd1a - cropping) / (dd1a - dd1b)
-      f2 = (cropping - dd2a) / (dd2b - dd2a)
-      addPoints = []
-      if f1 > 0.01 / cropping:
-        p1b = interpolatePoint(p1a, p1b, f1)
-        newPoints.append(p1b)
-        
-      if f2 < 1 - 0.01 / cropping:
-        p2a = interpolatePoint(p2a, p2b, f1)
-        addPoints.append(p2a)
-
-      pArc = arcFit(p1a, p1b, p2a, p2b, maxRadius = cropping) + addPoints
-
-      if k < j:
-        # this wraps around, so either first point is a corner point, or the last point
-        iMid = (len(pArc) - 1) // 2
-        pArc1 = pArc[:iMid]
-        pArc2 = pArc[iMid:]
-        if i == 0:
-          endPoints = pArc1
-          newPoints = pArc2
-        else:
-          newPoints = pArc2 + newPoints + pArc1
-          endPoints = []
-      else:
-        newPoints += pArc
-    else:
-      newPoints.append(p)
-
-  newPoints += endPoints
-
-  stderr.write(f'points after cropping = {len(newPoints)}\n')
-  return newPoints
-
-def smoothPoints(points, smoothXY=0, smoothZ=0, isLoop=False):
-  '''smooth points with the given sigma values.  Loop courses wrap around.'''
-  stderr.write(f'smoothing with xy sigma = {smoothXY}, z sigmaZ = {smoothZ}, isLoop = {isLoop}\n')
-
-  if smoothXY is None or smoothXY < 0:
-    smoothXY = 0
-  if smoothZ is None or smoothZ < 0:
-    smoothZ = 0
-  if smoothXY <= 0 and smoothZ <= 0:
-    return points
-
-  wList = [1]
-  for u in range(1, 41):
-    wList.append(exp(- u ** 2 / 200))
-
-  N = len(points)
-  # create distance field
-  ds = [0]
-  for i in range(N - 1):
-    ds.append(ds[-1] + pointDistance(points[i], points[i + 1]))
-  courseDistance = ds[-1]
-  if isLoop:
-    courseDistance += pointDistance(points[-1], points[0])
-
-
-  #
-  # refine the mesh: add mesh points proximate to points
-  #
-
-  # do refinements in order of refinement
-  sigmas = []
-  if smoothXY > 0:
-    sigmas.append(smoothXY)
-  if smoothZ > 0:
-    sigmas.append(smoothZ)
-  if len(sigmas) > 1:
-    if sigmas[0] < sigmas[1]:
-      s = sigmas[0]
-      sigmas[0] = sigmas[1]
-      sigmas[1] = s
-    # if the sigmas are similar, just use the broader sigma
-    if sigmas[0] < 1.2 * sigmas[1]:
-      sigmas = [sigmas[0]]
-
-  newPoints = [[[], []] for p in points]
-  newDs = [[[], []] for p in points]
-
-  # create refinement region in the zones around each point
-  regions = []    # list: for each sigma, for each point, 2 refinement region, each with 2 bounds
-  ns = 0
-  for sigma in sigmas:
-    regions.append([])
-    r = 2 * sigma
-    for i in range(N):
-      d = ds[i]
-      d1 = d - r
-      if not isLoop and d1 < 0:
-        d1 = 0
-      if isLoop or i > 0:
-       dMid = max(0, interpolatePosition(ds[i - 1], ds[i], 0.5, courseDistance, isLoop))   # midpoint between points
-       if d1 < dMid:
-         d1 = dMid
-      d2 = d + r
-      if not isLoop and d1 > courseDistance:
-        d1 = courseDistance
-      if isLoop or i < N - 1:
-       dMid = interpolatePosition(ds[i], ds[(i + 1) % N], 0.5, courseDistance, isLoop)   # midpoint between points
-       if d2 > dMid:
-         d2 = dMid
-      # refinement region for this spacing is from d1 to d2, retaining original point
-      regions[ns].append([[d1, d], [d, d2]])
-
-      # if there's an additional region, it gets split
-      for n in range(ns):
-        regions[n][i][0][1] = d1   # end of first region
-        regions[n][i][1][0] = d2   # start of 2nd region
-    ns += 1
-
-  nNewPoints = 0
-  for i in range(N):
-    # sigma regions prior to point
-    for ns in range(len(sigmas)):
-      spacing = sigmas[ns] / 2
-      d1 = regions[ns][i][0][0]
-      d2 = regions[ns][i][0][1]
-      NPoints = 1 + int((d2 - d1) / spacing)
-
-      # avoid close points at the boundary
-      n1 = 0
-      dMid = max(0, interpolatePosition(ds[i], ds[i - 1], 0.5, courseDistance, isLoop))   # midpoint between points
-      if abs(d1 - dMid) < spacing / 4:
-        n1 = 1
-
-      dd = deltaPosition(ds[i - 1], ds[i], courseDistance = courseDistance, isLoop = isLoop)
-      for n in range(n1, NPoints):
-        d = interpolatePosition(d1, d2, f= n / NPoints, courseDistance = courseDistance)
-        f = deltaPosition(ds[i - 1], d, courseDistance = courseDistance, isLoop = isLoop) / dd
-        newPoints[i][0].append(interpolatePoint(points[i - 1], points[i], f))
-        newDs[i][0].append(d)
-        nNewPoints += 1
-
-    # sigma regions after point
-    for ns in reversed(range(len(sigmas))):
-      spacing = sigmas[ns] / 2
-      d1 = regions[ns][i][1][0]
-      d2 = regions[ns][i][1][1]
-      NPoints = 1 + int((d2 - d1) / spacing)
-      dd = deltaPosition(ds[i], ds[(i + 1) % N], courseDistance = courseDistance, isLoop = isLoop)
-      for n in range(1, NPoints):
-        d = interpolatePosition(d1, d2, f= n / NPoints, courseDistance = courseDistance)
-        f = deltaPosition(ds[i], d, courseDistance = courseDistance, isLoop = isLoop) / dd
-        newPoints[i][1].append(interpolatePoint(points[i], points[(i + 1) % N], f))
-        newDs[i][1].append(d)
-        nNewPoints += 1
-
-      # revise possible duplicate points at the boundary
-      if isLoop or i < N - 1:
-        dMid = interpolatePosition(ds[i], ds[(i + 1) % N] , 0.5, courseDistance, isLoop)   # midpoint between points
-        # if we're close to the mid-point, use that instead
-        if len(newPoints[i][1]) > 0 and abs(d2 - dMid) < spacing / 4:
-          newPoints[i][1][-1] = interpolatePoint(points[i], points[(i + 1) % N], 0.5)
-      # end of point to point, don't put a point too close to the final point
-      if not isLoop and i == N - 1 and abs(d2 - courseDistance) < spacing / 4 and len(newPoints[i][1]) > 0:
-        newPoints[i][1].pop()
-        newDs[i][1].pop()
-        nNewPoints -= 1
-
-  # if we added new points, splice them in
-  # before the first point goes at the end
-  if nNewPoints > 0:
-    pRefined = []
-    dRefined = []
-    for i in range(N):
-      if i > 0:
-        pRefined += newPoints[i][0]
-        dRefined += newDs[i][0]
-      pRefined += [points[i]] + newPoints[i][1]
-      dRefined += [ds[i]] + newDs[i][1]
-    if isLoop:
-      pRefined += newPoints[0][0]
-      dRefined += newDs[0][0]
-    points = pRefined
-    ds = dRefined
-    N = len(points)
-
-  #
-  # do smoothing on refined mesh
-  #
-
-  newLats = []
-  newLons = []
-  newEles = []
-  if smoothXY > 0:
-    uXYs = [d / smoothXY for d in ds]
-    cdXY = courseDistance / smoothXY
-    j = 0
-    k = 0
-    if isLoop:
-      while ((j - 1) % N != i % N) and deltaPosition(uXYs[j], uXYs[i], cdXY, isLoop) < 3:
-        j = (j - 1) % N
-
-    lons = [points[0].longitude]   # avoid antimeridian problems
-    for i in range(N - 1):
-      dLon = points[i + 1].longitude - points[i].longitude
-      dLon -= 360 * floor(0.5 + dLon / 360)
-      lons.append(lons[-1] + dLon)
-
-    for i in range(N):
-      if isLoop:
-        iLast = (i - 1) % N
-      else:
-        iLast = N - 1
-      while (k % N != iLast) and deltaPosition(uXYs[i], uXYs[k], cdXY, isLoop) < 3:
-        k = (k + 1) % N
-      while (j % N != i) and deltaPosition(uXYs[(j + 1) % N], uXYs[i], cdXY, isLoop) > 3:
-        j = (j + 1) % N
-      # smooth from k to j
-      u = j
-      sumw = 0
-      sumLat = 0
-      sumLon = 0
-      while True:
-        d = deltaPosition(uXYs[u], uXYs[i], cdXY, isLoop)
-        nw = int(10 * abs(d) + 0.5)
-        w = wList[int(10 * abs(d) + 0.5)] if nw < len(wList) else 0
-        sumw += w
-        sumLat += w * points[u].latitude
-        sumLon += w * lons[u]
-        if u == k:
-          break
-        u = (u + 1) % N
-
-      lat = sumLat / sumw
-      lon = sumLon / sumw
-      lon -= 360 * floor(0.5 + lon / 360)
-      newLats.append(lat)
-      newLons.append(lon)
-
-  if (smoothZ > 0):
-    uZs = [d / smoothZ for d in ds]
-    cdZ = courseDistance / smoothZ
-    j = 0
-    k = 0
-    if isLoop:
-      while ((j - 1) % N != i % N) and deltaPosition(uZs[j], uZs[i], cdZ, isLoop) < 3:
-        j = (j - 1) % N
-
-    lons = [points[0].longitude]   # avoid antimeridian problems
-    for i in range(N - 1):
-      dLon = points[i + 1].longitude - points[i].longitude
-      dLon -= 360 * floor(0.5 + dLon / 360)
-      lons.append(lons[-1] + dLon)
-
-    for i in range(N):
-      if isLoop:
-        iLast = (i - 1) % N
-      else:
-        iLast = N - 1
-      while (k % N != iLast) and deltaPosition(uZs[i], uZs[k], cdZ, isLoop) < 3:
-        k = (k + 1) % N
-      while (j % N != i) and deltaPosition(uZs[(j + 1) % N], uZs[i], cdZ, isLoop) > 3:
-        j = (j + 1) % N
-      # smooth from k to j
-      u = j
-      sumw = 0
-      sumEle = 0
-      while True:
-        d = deltaPosition(uZs[u], uZs[i], cdZ, isLoop)
-        nw = int(10 * abs(d) + 0.5)
-        w = wList[int(10 * abs(d) + 0.5)] if nw < len(wList) else 0
-        sumw += w
-        sumEle += w * points[u].elevation
-        if u == k:
-          break
-        u = (u + 1) % N
-
-      ele = sumEle / sumw
-      newEles.append(ele)
-
-  if len(newLons) > 0:
-    for p, lat, lon  in zip(points, newLats, newLons):
-      p.latitude = lat
-      p.longitude = lon
-
-  if len(newEles) > 0:
-    for p, ele  in zip(points, newEles):
-      p.elevation = ele
-
-  return points
 
 def export_gpx(points, output_file, input_file):
   '''
@@ -883,10 +447,31 @@ def main():
   )
 
   parser.add_argument(
-    '-a', '--apikey', '--APIKey',
+    '--apikey', '--APIKey',
     type=str,
     default= API_KEY,
     help='39 character Google Maps API key.'
+  )
+
+  parser.add_argument(
+    '-a', '--auto',
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help='Specify a list of defaults suitable for preparing BikeTerra routes, for example.',
+  )
+
+  parser.add_argument(
+    '-s', '--simplify',
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help='whether the simplificatin algorithm is used before snapping to reduce the number of API calls',
+  )
+
+  parser.add_argument(
+    '--postSimplify',
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help='whether the simplificatin algorithm is used at the end of the process',
   )
 
   parser.add_argument(
@@ -903,15 +488,10 @@ def main():
     help='Enable or disable interpolation (optional, default: True).',
   )
 
-  parser.add_argument(
-    '-s', '--simplify',
-    action=argparse.BooleanOptionalAction,
-    default=None,
-    help='whether the simplificatin algorithm is used before snapping to reduce the number of API calls',
-  )
 
   parser.add_argument(
     '-l', '--loop',
+    action=argparse.BooleanOptionalAction,
     default=None,
     help='specify that the course is m loop.  This is normally determined automatically.  Specify no loop with --no-loop.',
   )
@@ -948,19 +528,39 @@ def main():
     '--cornerCropping',
     type=float,
     default=None,
-    help='smoothing distance applied to positions (default = 0)',
+    help='crop corners by this many meters (default = 0)',
   )
 
   parser.add_argument(
     '--cornerCrop',
     action=argparse.BooleanOptionalAction,
     default=None,
-    help='smoothing distance applied to positions (default = 0)',
+    help='crop corners with default distance (default: false)',
   )
 
+  parser.add_argument(
+    '--minRadius',
+    type=float,
+    default=None,
+    help='set minimum radius in corners to this many meters (default = 0)',
+  )
+
+  parser.add_argument(
+    '-v', '--version',
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=f'print the version number {__version__} and exit.',
+  )
+
+  
   args = parser.parse_args()
 
+  if args.version:
+    stderr.write(progName + ' version ' + __version__ + '\n')
+    sys.exit()
+
   # --- Access the parsed values ---
+  auto = args.auto
   input_file = args.input
   output_file = args.output
   snap = args.snap
@@ -968,17 +568,45 @@ def main():
   simplify = args.simplify
   if simplify is None:
     simplify =  snap
+  postSimplify = args.postSimplify
   isLoop = args.loop
   api_key = args.apikey
   cornerCropping = args.cornerCropping
+  minRadius = args.minRadius
+  smooth = args.smooth
+  smoothXY = args.smoothXY
+  smoothZ = args.smoothZ
+  smoothing = args.smoothing
+
+
+  if auto:
+    if minRadius is None:
+      minRadius = 6
+    if cornerCropping is None:
+      cornerCropping = max(minRadius, 6)
+    if smoothZ is None and smoothing is None:
+      smoothZ = 12
+    if smoothXY is None and smoothing is None:
+      smoothXY = 5
+    if postSimplify is None:
+      postSimplify = True
+
+  if smooth is None:
+    smoothZ = 12
+    smoothXY = 5
+
+  if minRadius is not None:
+    if cornerCropping is None:
+      cornerCropping = minRadius
+
   if cornerCropping is None:
     if args.cornerCrop:
       cornerCropping = 6
     else:
       cornerCropping = 0
-  if args.smoothXY is None:
-    if args.smoothing is None:
-      if args.smooth:
+  if smoothXY is None:
+    if smoothing is None:
+      if smooth:
         if cornerCropping > 0:
           smoothXY = 3
         else:
@@ -988,21 +616,30 @@ def main():
     else:
       smoothXY = 0
   else:
-    smoothXY = args.smoothXY
-  if args.smoothZ is None:
-    if args.smoothing is None:
-      if args.smooth:
+    smoothXY = smoothXY
+  if smoothZ is None:
+    if smoothing is None:
+      if smooth:
         smoothZ = 12
       else:
         smoothZ = 0
     else:
       smoothZ = 0
   else:
-    smoothZ = args.smoothZ
-  if args.smoothing is not None and args.smoothing > 0:
-    smoothXY = sqrt(smoothXY ** 2 + args.smoothing ** 2)
-    smoothZ  = sqrt(smoothZ ** 2 + args.smoothing ** 2)
-  stderr.write(f'input_file = {input_file}\noutput_file = {output_file}\ninterpolate = {interpolate}\napi_key = {api_key}, isLoop = {isLoop}\n')
+    smoothZ = smoothZ
+  if smoothing is not None and smoothing > 0:
+    smoothXY = sqrt(smoothXY ** 2 + smoothing ** 2)
+    smoothZ  = sqrt(smoothZ ** 2 + smoothing ** 2)
+
+  if minRadius is not None and minRadius > 0 and smoothXY is None and smoothing is None and (smoothXY is None or smoothXY < 3):
+    smoothXY = 3
+    if smoothZ is None:
+      smoothZ = smoothXY
+    else:
+      smoothZ = sqrt(smoothZ ** 2 + 3 ** 2)
+
+  if postSimplify is None:
+    postSimplify = smoothZ > 0 or smoothXY > 0
 
   if isinstance(input_file, str):
     if input_file == '-':
@@ -1036,7 +673,10 @@ def main():
 
   try:
     # Step 1: Load GPX file
-    points = removeDuplicatePoints(load_gpx(input_file))
+    if isinstance(input_file, str) and not path.exists(input_file):
+      stderr.write(f'file {input_file} not found\n')
+      sys.exit()
+    points = removeDuplicatePoints(loadGPX(input_file))
 
     if not points:
       stderr.write('Error: No points found in GPX file\n')
@@ -1053,30 +693,61 @@ def main():
 
     stderr.write(f'initial points = {len(points)}\n')
 
-    # Step 2: simplify points
+    # step 2: remove zig-zags
+    points = fixZigZags(points= points, isLoop= isLoop)
+    
+    # step 3: check for loops
+    stderr.write(f'checking for loops...\n')
+    findLoops(points= points, isLoop= isLoop)
+    
+    # Step 3: simplify points
     if simplify:
       points = simplifyPoints(points= points)
       stderr.write(f'simplified points = {len(points)}\n')
 
-    # Step 3: remove coincident points
+    # Step 4: remove coincident points
     points = averageCoincidentPoints(points)
 
     if snap:
-      # Step 4: Snap points to roads
-      points = averageCoincidentPoints(snap_to_roads(points = points, api_key = api_key, interpolate= interpolate, isLoop= isLoop))
+      # Step 5: Snap points to roads
+      points = snap_to_roads(points = points, api_key = api_key, interpolate= interpolate, isLoop= isLoop)
+      points = averageCoincidentPoints(points= points)
+      points = fixZigZags(points= points, isLoop= isLoop)      
 
-    # step 5: crop corners
+    # step 6: crop corners
     if cornerCropping > 0:
       points = cropCorners(points= points, cropping= cornerCropping, isLoop= isLoop)
 
-    # step 6: make sure altitudes are smooth (if it's a loop course)
+    # step 7: make sure altitudes are smooth (if it's a loop course)
     if isLoop:
       fixLoopAltitudes(points = points)
 
-    # step 7: smooth points
-    points = smoothPoints(points= points, smoothXY= smoothXY, smoothZ= smoothZ, isLoop= isLoop)
+    # step 8-9: smooth points and minimum radius
+    doSmoothing = smoothXY is not None and smoothZ is not None and smoothXY > 0 and smoothZ > 0
+    if minRadius is not None and minRadius > 0:
+      if doSmoothing:
+        distances, courseDistance = calcDistances(points, isLoop = True)
+        spacing = 3 * (1 + courseDistance / 250) ** (1/4);
+        points, distances, indexMap = applySelectiveSpacing(points = points, spacing = spacing, isLoop = isLoop)
+        sqrt2 = sqrt(2)
+        points = smoothPoints(points= points, smoothXY= smoothXY / sqrt2, smoothZ= smoothZ / sqrt2, isLoop= isLoop)
+      points = applyMinRadius(points= points, minRadius = minRadius, isLoop= isLoop)
+      if doSmoothing:
+        points = smoothPoints(points= points, smoothXY= smoothXY / sqrt2, smoothZ= smoothZ / sqrt2, isLoop= isLoop)
+    else:
+      if doSmoothing:
+        distances, courseDistance = calcDistances(points, isLoop = True)
+        spacing = 3 * (1 + courseDistance / 250) ** (1/4);
+        points, distances, indexMap = applySelectiveSpacing(points = points, spacing = spacing, isLoop = isLoop)
+        points = smoothPoints(points= points, smoothXY= smoothXY, smoothZ= smoothZ, isLoop= isLoop)
+    stderr.write(f'number of points after processing = {len(points)}\n')
 
-    # step 8: export points
+    # step 10: simplify points at end
+    if postSimplify:
+      points = simplifyPoints(points= points, z0= 0.1, r0= 0.5)
+      stderr.write(f'simplified points = {len(points)}\n')
+
+    # step 11: export points
     export_gpx(points= points, output_file = output_file, input_file = input_file)
 
     stderr.write('\n✓ Process completed successfully!\n')
